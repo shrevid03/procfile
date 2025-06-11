@@ -1,0 +1,186 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.applications import EfficientNetV2B0
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization, Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from sklearn.model_selection import train_test_split
+import os
+import ssl
+import matplotlib.pyplot as plt
+
+# Fix SSL Certificate Issue
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Constants
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS = 50
+SEED = 42
+
+# Paths
+csv_path = "/Users/priyanshu/Downloads/ISIC_2019/ISIC_2019_Training_GroundTruth.csv"
+img_dir = "/Users/priyanshu/Downloads/ISIC_2019/ISIC_2019_Training_Input/ISIC_2019_Training_Input"
+
+# ---------------------------------------------------------------
+# 1. Data Preparation (MEL and NV only)
+# ---------------------------------------------------------------
+print("Loading and preprocessing data...")
+
+# Load and filter MEL and NV
+lesion_df = pd.read_csv(csv_path)[['image', 'MEL', 'NV']]
+df = lesion_df[(lesion_df['MEL'] == 1) | (lesion_df['NV'] == 1)].copy()
+df['label'] = df[['MEL', 'NV']].idxmax(axis=1)
+
+# Balance classes
+target_mel = df[df['label'] == 'MEL'].head(1000)
+target_nv = df[df['label'] == 'NV'].head(1000)
+df = pd.concat([target_mel, target_nv]).sample(frac=1, random_state=SEED).reset_index(drop=True)
+
+# Add image paths
+df['image_path'] = df['image'].apply(lambda x: os.path.join(img_dir, x + '.jpg'))
+df = df[df['image_path'].apply(os.path.exists)]
+
+# Map label to integer for sparse encoding
+df['target'] = df['label'].map({'MEL': 0, 'NV': 1})
+
+# Split data
+train_df, test_df = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=SEED)
+train_df, val_df = train_test_split(train_df, test_size=0.2, stratify=train_df['label'], random_state=SEED)
+
+# ---------------------------------------------------------------
+# 2. Image Data Pipeline
+# ---------------------------------------------------------------
+def preprocess_image(image, training=False):
+    image = tf.image.resize(image, IMG_SIZE)
+    image = tf.keras.applications.efficientnet_v2.preprocess_input(image)
+    if training:
+        image = tf.image.random_flip_left_right(image)
+        image = tf.image.random_flip_up_down(image)
+        image = tf.image.random_brightness(image, 0.2)
+        image = tf.image.random_contrast(image, 0.8, 1.2)
+    return image
+
+
+def create_dataset(df, training=False):
+    paths = df['image_path'].values
+    labels = df['target'].values.astype(np.int32)
+
+    def load_image(path, label):
+        image = tf.io.read_file(path)
+        image = tf.image.decode_jpeg(image, channels=3)
+        image = preprocess_image(image, training)
+        return image, label
+
+    dataset = tf.data.Dataset.from_tensor_slices((paths, labels))
+    dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+    if training:
+        dataset = dataset.shuffle(1024)
+    return dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+train_dataset = create_dataset(train_df, training=True)
+val_dataset = create_dataset(val_df)
+test_dataset = create_dataset(test_df)
+
+# ---------------------------------------------------------------
+# 3. Model Definition
+# ---------------------------------------------------------------
+def build_model():
+    inputs = Input(shape=(*IMG_SIZE, 3))
+    base_model = EfficientNetV2B0(include_top=False, weights='imagenet', input_tensor=inputs, pooling='avg')
+    base_model.trainable = False  # Freeze for initial training
+
+    x = Dense(512, activation='swish')(base_model.output)
+    x = Dropout(0.5)(x)
+    x = BatchNormalization()(x)
+    outputs = Dense(2, activation='softmax')(x)  # Softmax for mutually exclusive classes
+
+    return Model(inputs, outputs)
+
+model = build_model()
+
+# Compile with sparse categorical crossentropy
+model.compile(
+    optimizer=Adam(1e-3),
+    loss='sparse_categorical_crossentropy',
+    metrics=[
+        'accuracy',
+        tf.keras.metrics.Precision(name='precision'),
+        tf.keras.metrics.Recall(name='recall'),
+        tf.keras.metrics.AUC(name='auc', multi_label=False)
+    ]
+)
+
+# ---------------------------------------------------------------
+# 4. Phase 1: Feature Extraction
+# ---------------------------------------------------------------
+print("\nPhase 1: Feature Extraction")
+history_fe = model.fit(
+    train_dataset,
+    validation_data=val_dataset,
+    epochs=20,
+    callbacks=[
+        EarlyStopping(monitor='val_auc', patience=3, restore_best_weights=True),
+        ReduceLROnPlateau(factor=0.5, patience=2)
+    ]
+)
+
+# ---------------------------------------------------------------
+# 5. Phase 2: Fine-Tuning
+# ---------------------------------------------------------------
+print("\nPhase 2: Fine-Tuning")
+base_model = model.layers[1]
+base_model.trainable = True  # Unfreeze EfficientNet
+
+# Recompile with lower learning rate
+model.compile(
+    optimizer=Adam(1e-5),
+    loss='sparse_categorical_crossentropy',
+    metrics=[
+        'accuracy',
+        tf.keras.metrics.Precision(name='precision'),
+        tf.keras.metrics.Recall(name='recall'),
+        tf.keras.metrics.AUC(name='auc', multi_label=False)
+    ]
+)
+
+history_ft = model.fit(
+    train_dataset,
+    validation_data=val_dataset,
+    epochs=EPOCHS,
+    callbacks=[
+        EarlyStopping(monitor='val_auc', patience=5, restore_best_weights=True),
+        ReduceLROnPlateau(factor=0.2, patience=3),
+        ModelCheckpoint('melanoma_nevus_model.h5', save_best_only=True, monitor='val_auc', mode='max')
+    ]
+)
+
+# ---------------------------------------------------------------
+# 6. Save Final Model
+# ---------------------------------------------------------------
+model.save("melanoma_nevus_model.h5")
+print("\nModel saved as 'melanoma_nevus_model.h5'")
+
+# ---------------------------------------------------------------
+# 7. Prediction Function
+# ---------------------------------------------------------------
+def predict_mel_nv(image_path):
+    """
+    Predict probability of Melanoma (class 0) vs Nevus (class 1) using only image.
+    Returns probabilities summing to 1.
+    """
+    img = tf.io.read_file(image_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = preprocess_image(img)
+    img = tf.expand_dims(img, axis=0)
+    pred = model.predict(img)[0]
+
+    return {
+        'Melanoma_probability': float(pred[0]),
+        'Nevus_probability': float(pred[1])
+    }
+
+# Example:
+# print(predict_mel_nv('/path/to/sample_image.jpg'))
